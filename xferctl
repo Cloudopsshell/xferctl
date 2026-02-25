@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+
+import boto3
+import json
+import re
+import os
+import argparse
+import sys
+import time
+from datetime import datetime, timezone
+
+from boto3.s3.transfer import S3Transfer, TransferConfig
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.rule import Rule
+from rich.progress import Progress, BarColumn, TextColumn
+
+console = Console()
+
+def utc_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def human_size(num):
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
+        if abs(num) < 1024.0:
+            return f"{num:3.2f} {unit}"
+        num /= 1024.0
+    return f"{num:.2f} PB"
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="S3 copy tool that supports copying between S3 buckets in same account and cross-account"
+    )
+    parser.add_argument('--mode', choices=['cross-account', 'same-account'], default='same-account',
+                        help='Copy mode: cross-account or same-account (default)')
+    parser.add_argument('--source-region', required=False, help='Source S3 bucket region (optional, uses AWS default if omitted)')
+    parser.add_argument('--source-bucket', required=True, help='Source S3 bucket name')
+    parser.add_argument('--dest-region', required=False, help='Destination S3 bucket region (optional, uses AWS default if omitted)')
+    parser.add_argument('--dest-bucket', required=True, help='Destination S3 bucket name')
+    parser.add_argument('--source-path', required=False, help='Source prefix (subfolder) to copy from (optional)')
+    parser.add_argument('--dest-path', required=False, help='Destination prefix (subfolder) to copy to (optional)')
+    parser.add_argument('--exclude-path', action='append', default=[],
+                        help='Exclude source subfolder(s) from copy (can be used multiple times)')
+    parser.add_argument('--cleanup', action='store_true', help='Clean up migration role/policy and bucket policy after copy')
+    return parser.parse_args()
+
+def show_banner():
+    console.print(Panel.fit("[bold cyan]🪣  S3 Copy Tool[/bold cyan]", border_style="cyan"))
+
+def cleanup_iam_user_and_policy(dest_creds, iam_username, policy_name):
+    iam = boto3.client(
+        'iam',
+        aws_access_key_id=dest_creds['AWS_ACCESS_KEY_ID'],
+        aws_secret_access_key=dest_creds['AWS_SECRET_ACCESS_KEY'],
+        aws_session_token=dest_creds['AWS_SESSION_TOKEN']
+    )
+
+    # Delete all access keys
+    try:
+        keys = iam.list_access_keys(UserName=iam_username)['AccessKeyMetadata']
+        for k in keys:
+            try:
+                iam.delete_access_key(UserName=iam_username, AccessKeyId=k['AccessKeyId'])
+                console.print(f"[yellow]Deleted access key:[/yellow] {k['AccessKeyId']}")
+            except Exception as e:
+                console.print(f"[red][ERROR][/red] Failed to delete access key {k['AccessKeyId']}: {e}")
+    except iam.exceptions.NoSuchEntityException:
+        console.print(f"[yellow]IAM user {iam_username} not found, skipping access key deletion.[/yellow]")
+        return
+    except Exception as e:
+        console.print(f"[red]Error listing access keys:[/red] {e}")
+
+    # Delete user policy
+    try:
+        iam.delete_user_policy(UserName=iam_username, PolicyName=policy_name)
+        console.print(f"[yellow]Deleted policy[/yellow] {policy_name} from user {iam_username}")
+    except iam.exceptions.NoSuchEntityException:
+        console.print(f"[yellow]Policy {policy_name} not found on user {iam_username}[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error deleting policy:[/red] {e}")
+
+    # Delete user
+    try:
+        iam.delete_user(UserName=iam_username)
+        console.print(f"[green]Deleted IAM user[/green] {iam_username}")
+    except iam.exceptions.NoSuchEntityException:
+        console.print(f"[yellow]User {iam_username} not found[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error deleting IAM user:[/red] {e}")
+
+def cleanup_bucket_policy_for_iam_user(source_creds, source_bucket, iam_user_arn):
+    s3 = boto3.client(
+        's3',
+        aws_access_key_id=source_creds['AWS_ACCESS_KEY_ID'],
+        aws_secret_access_key=source_creds['AWS_SECRET_ACCESS_KEY'],
+        aws_session_token=source_creds['AWS_SESSION_TOKEN']
+    )
+
+    try:
+        current_policy_str = s3.get_bucket_policy(Bucket=source_bucket)['Policy']
+        current_policy = json.loads(current_policy_str)
+        statements = current_policy.get('Statement', [])
+
+        new_statements = [
+            s for s in statements
+            if not (s.get('Sid') == 'AllowCopyFromMigrationUser'
+                    and s.get('Principal', {}).get('AWS') == iam_user_arn)
+        ]
+
+        if len(new_statements) == len(statements):
+            console.print(f"[yellow]No migration IAM user statement found in bucket policy for[/yellow] {source_bucket}")
+            return
+
+        if not new_statements:
+            s3.delete_bucket_policy(Bucket=source_bucket)
+            console.print(f"[green]Deleted entire bucket policy for[/green] {source_bucket}")
+        else:
+            current_policy['Statement'] = new_statements
+            s3.put_bucket_policy(Bucket=source_bucket, Policy=json.dumps(current_policy))
+            console.print(f"[green]Removed migration IAM user statement from bucket policy for[/green] {source_bucket}")
+
+    except s3.exceptions.NoSuchBucketPolicy:
+        console.print(f"[yellow]No bucket policy found for[/yellow] {source_bucket}")
+    except Exception as e:
+        console.print(f"[red]Error removing migration IAM user statement:[/red] {e}")
+
+def check_source_path_exists(s3_client, bucket, source_path):
+    prefix = source_path.rstrip('/') + '/'
+    response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+    return 'Contents' in response
+
+def prompt_for_credentials_block(account_name):
+    console.print(f"\nPaste {account_name} credentials block (all three export lines), then press Enter on a blank line:\n")
+    lines = []
+    while True:
+        line = sys.stdin.readline()
+        if not line or line.strip() == "":
+            break
+        lines.append(line.rstrip('\n'))
+
+    block = '\n'.join(lines)
+
+    creds = {'AWS_ACCESS_KEY_ID': '', 'AWS_SECRET_ACCESS_KEY': '', 'AWS_SESSION_TOKEN': ''}
+    block = re.sub(r'Paste.*', '', block)
+
+    export_lines = re.findall(
+        r'export (AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)="([^"]+)"',
+        block,
+        re.MULTILINE
+    )
+
+    for key, value in export_lines:
+        creds[key] = value.strip()
+
+    # keep your clear+banner behavior
+    try:
+        os.system('clear')
+    except Exception:
+        pass
+    show_banner()
+
+    return creds
+
+def get_account_id(region, creds):
+    sts = boto3.client(
+        'sts',
+        region_name=region,
+        aws_access_key_id=creds['AWS_ACCESS_KEY_ID'],
+        aws_secret_access_key=creds['AWS_SECRET_ACCESS_KEY'],
+        aws_session_token=creds['AWS_SESSION_TOKEN']
+    )
+    return sts.get_caller_identity()['Account']
+
+def create_iam_user_with_policy(dest_creds, dest_account_id, dest_bucket, source_bucket):
+    iam = boto3.client(
+        'iam',
+        aws_access_key_id=dest_creds['AWS_ACCESS_KEY_ID'],
+        aws_secret_access_key=dest_creds['AWS_SECRET_ACCESS_KEY'],
+        aws_session_token=dest_creds['AWS_SESSION_TOKEN']
+    )
+
+    username = 's3copy-migration-user'
+    policy_name = 's3copy-migration-policy'
+    console.print(f"[cyan]Ensuring IAM user:[/cyan] {username}")
+
+    # Check if user exists
+    try:
+        iam.get_user(UserName=username)
+        console.print(f"[yellow]User {username} already exists.[/yellow]")
+    except iam.exceptions.NoSuchEntityException:
+        iam.create_user(UserName=username)
+        console.print(f"[green]Created IAM user:[/green] {username}")
+
+    policy_doc = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "s3:ListBucket",
+                    "s3:GetObject",
+                    "s3:GetObjectVersion",
+                    "s3:GetObjectTagging"
+                ],
+                "Resource": [
+                    f"arn:aws:s3:::{source_bucket}",
+                    f"arn:aws:s3:::{source_bucket}/*"
+                ]
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "s3:PutObject",
+                    "s3:PutObjectAcl"
+                ],
+                "Resource": f"arn:aws:s3:::{dest_bucket}/*"
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:ListBucket"],
+                "Resource": f"arn:aws:s3:::{dest_bucket}"
+            }
+        ]
+    }
+
+    # Check if policy exists and matches
+    policy_needs_update = True
+    try:
+        existing_policy = iam.get_user_policy(UserName=username, PolicyName=policy_name)
+        existing_doc = existing_policy['PolicyDocument']
+        if json.dumps(existing_doc, sort_keys=True) == json.dumps(policy_doc, sort_keys=True):
+            console.print(f"[green]Policy {policy_name} already attached and up-to-date[/green]")
+            policy_needs_update = False
+        else:
+            console.print(f"[yellow]Policy {policy_name} exists but differs. Updating policy.[/yellow]")
+    except iam.exceptions.NoSuchEntityException:
+        console.print(f"[yellow]Policy {policy_name} does not exist. Attaching policy.[/yellow]")
+
+    if policy_needs_update:
+        iam.put_user_policy(
+            UserName=username,
+            PolicyName=policy_name,
+            PolicyDocument=json.dumps(policy_doc)
+        )
+        console.print(f"[green]Attached/Updated policy[/green] {policy_name}")
+
+    # Always delete all existing access keys and create a fresh one
+    keys = iam.list_access_keys(UserName=username)['AccessKeyMetadata']
+    if keys:
+        console.print(f"[yellow]User {username} already has {len(keys)} access key(s). Deleting all existing access keys...[/yellow]")
+        for k in keys:
+            try:
+                iam.delete_access_key(UserName=username, AccessKeyId=k['AccessKeyId'])
+                console.print(f"[yellow]Deleted access key:[/yellow] {k['AccessKeyId']}")
+            except Exception as e:
+                console.print(f"[red][ERROR][/red] Failed to delete access key {k['AccessKeyId']}: {e}")
+
+    access_key = iam.create_access_key(UserName=username)['AccessKey']
+    console.print(f"[green]Created new access key for {username}.[/green] AccessKeyId: {access_key['AccessKeyId']}")
+    console.print(f"[green]IAM user ready.[/green] AccessKeyId: {access_key['AccessKeyId']}")
+
+    return {
+        'AWS_ACCESS_KEY_ID': access_key['AccessKeyId'],
+        'AWS_SECRET_ACCESS_KEY': access_key['SecretAccessKey']
+    }, username, policy_name
+
+def update_source_bucket_policy_for_iam_user(source_creds, source_bucket, iam_user_arn):
+    s3 = boto3.client(
+        's3',
+        aws_access_key_id=source_creds['AWS_ACCESS_KEY_ID'],
+        aws_secret_access_key=source_creds['AWS_SECRET_ACCESS_KEY'],
+        aws_session_token=source_creds['AWS_SESSION_TOKEN']
+    )
+
+    new_statement = {
+        "Sid": "AllowCopyFromMigrationUser",
+        "Effect": "Allow",
+        "Principal": {"AWS": iam_user_arn},
+        "Action": [
+            "s3:ListBucket",
+            "s3:GetObject",
+            "s3:GetObjectVersion",
+            "s3:GetObjectTagging"
+        ],
+        "Resource": [
+            f"arn:aws:s3:::{source_bucket}",
+            f"arn:aws:s3:::{source_bucket}/*"
+        ]
+    }
+
+    try:
+        current_policy_str = s3.get_bucket_policy(Bucket=source_bucket)['Policy']
+        current_policy = json.loads(current_policy_str)
+        statements = current_policy.get('Statement', [])
+
+        # Full statement match check
+        for s in statements:
+            if json.dumps(s, sort_keys=True) == json.dumps(new_statement, sort_keys=True):
+                console.print(
+                    f"[green]Bucket policy for {source_bucket} already allows IAM user with correct permissions. No update needed.[/green]"
+                )
+                return
+
+        # Remove any old statement with same Sid
+        statements = [s for s in statements if s.get('Sid') != new_statement['Sid']]
+        statements.append(new_statement)
+        current_policy['Statement'] = statements
+        merged_policy = current_policy
+
+    except Exception:
+        # No existing policy
+        merged_policy = {
+            "Version": "2012-10-17",
+            "Statement": [new_statement]
+        }
+
+    # Retry logic for IAM principal propagation to S3
+    max_retries = 10
+    base_delay = 2  # seconds
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            s3.put_bucket_policy(
+                Bucket=source_bucket,
+                Policy=json.dumps(merged_policy)
+            )
+
+            console.print(
+                f"[green]Updated bucket policy for {source_bucket} to allow IAM user access.[/green]"
+            )
+            return
+
+        except s3.exceptions.ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code")
+
+            if error_code == "MalformedPolicy":
+                wait_time = base_delay * attempt  # simple linear backoff
+                console.print(
+                    f"[yellow]Attempt {attempt}/{max_retries} - "
+                    f"Principal not yet recognized by S3. Retrying in {wait_time}s...[/yellow]"
+                )
+                time.sleep(wait_time)
+            else:
+                raise
+
+    console.print(
+        "[red][ERROR] Bucket policy update failed due to principal propagation delay.[/red]"
+    )
+    sys.exit(1)
+
+def wait_for_iam_user_exists(dest_creds, iam_username, retries=20, delay=3):
+    """
+    Wait until IAM user becomes visible to AWS APIs.
+    Prevents: MalformedPolicy - Invalid principal in policy
+    """
+
+    iam = boto3.client(
+        'iam',
+        aws_access_key_id=dest_creds['AWS_ACCESS_KEY_ID'],
+        aws_secret_access_key=dest_creds['AWS_SECRET_ACCESS_KEY'],
+        aws_session_token=dest_creds['AWS_SESSION_TOKEN']
+    )
+
+    console.print("[cyan]Waiting for IAM user visibility...[/cyan]")
+
+    for attempt in range(1, retries + 1):
+        try:
+            iam.get_user(UserName=iam_username)
+            console.print("[green]✔ IAM user is now visible[/green]\n")
+            return
+        except Exception:
+            console.print(
+                f"[yellow]Attempt {attempt}/{retries} - IAM user not visible yet. Retrying in {delay}s...[/yellow]"
+            )
+            time.sleep(delay)
+
+    console.print("[red][ERROR] IAM user visibility timeout. Aborting.[/red]")
+    sys.exit(1)
+
+def wait_for_iam_ready(source_bucket, source_region, iam_creds, retries=20, delay=5):
+    """
+    Actively wait until the newly created IAM user credentials
+    can successfully access the source bucket.
+    """
+    console.print("[cyan]Waiting for IAM propagation...[/cyan]")
+
+    s3_test = boto3.client(
+        's3',
+        region_name=source_region,
+        aws_access_key_id=iam_creds['AWS_ACCESS_KEY_ID'],
+        aws_secret_access_key=iam_creds['AWS_SECRET_ACCESS_KEY'],
+        aws_session_token=iam_creds.get('AWS_SESSION_TOKEN')
+    )
+
+    for attempt in range(1, retries + 1):
+        try:
+            s3_test.list_objects_v2(Bucket=source_bucket, MaxKeys=1)
+            console.print("[green]✔ IAM propagation complete[/green]\n")
+            return
+        except Exception:
+            console.print(f"[yellow]Attempt {attempt}/{retries} - IAM not ready yet. Retrying in {delay}s...[/yellow]")
+            time.sleep(delay)
+
+    console.print("[red][ERROR] IAM propagation timeout. Aborting.[/red]")
+    sys.exit(1)
+
+def copy_objects(source_bucket,
+                 dest_bucket,
+                 source_region,
+                 dest_region,
+                 source_path=None,
+                 dest_path=None,
+                 iam_creds=None,
+                 exclude_paths=None):
+
+    if exclude_paths is None:
+        exclude_paths = []
+
+    source_prefix = '' if source_path in (None, '', '/') else source_path.rstrip('/') + '/'
+    dest_prefix = '' if dest_path in (None, '', '/') else dest_path.rstrip('/') + '/'
+
+    s3_source = boto3.client(
+        's3',
+        region_name=source_region,
+        aws_access_key_id=iam_creds['AWS_ACCESS_KEY_ID'],
+        aws_secret_access_key=iam_creds['AWS_SECRET_ACCESS_KEY'],
+        aws_session_token=iam_creds.get('AWS_SESSION_TOKEN')
+    )
+
+    s3_dest = boto3.client(
+        's3',
+        region_name=dest_region,
+        aws_access_key_id=iam_creds['AWS_ACCESS_KEY_ID'],
+        aws_secret_access_key=iam_creds['AWS_SECRET_ACCESS_KEY'],
+        aws_session_token=iam_creds.get('AWS_SESSION_TOKEN')
+    )
+
+    # Source path check (your logic)
+    if source_path:
+        console.print(f"[cyan]Checking if source path '{source_path}' exists...[/cyan]")
+        if not check_source_path_exists(s3_source, source_bucket, source_path):
+            console.print(f"[red][ERROR][/red] Source path '{source_path}' does not exist in bucket '{source_bucket}'")
+            sys.exit(1)
+        console.print("[green]Source path exists.[/green]\n")
+
+    transfer_config = TransferConfig(
+        multipart_threshold=8 * 1024 * 1024,
+        multipart_chunksize=8 * 1024 * 1024,
+        max_concurrency=4,
+        use_threads=True
+    )
+
+    paginator = s3_source.get_paginator('list_objects_v2')
+
+    files_copied = 0
+    files_failed = 0
+    files_skipped = 0
+    total_size_bytes = 0
+    t0 = time.time()
+
+    console.print(Rule("[bold cyan]📦 Copying Objects[/bold cyan]"))
+
+    for page in paginator.paginate(Bucket=source_bucket, Prefix=source_prefix):
+        for obj in page.get('Contents', []):
+            key = obj['Key']
+
+            if any(key.startswith(exclude) for exclude in exclude_paths):
+                console.print(f"[yellow]⚠ Skipping excluded path:[/yellow] {key}")
+                files_skipped += 1
+                continue
+
+            rel_key = key[len(source_prefix):]
+            if rel_key == '':
+                continue
+
+            dest_key = dest_prefix + rel_key
+
+            try:
+                head = s3_source.head_object(Bucket=source_bucket, Key=key)
+                size_bytes = head['ContentLength']
+            except Exception:
+                size_bytes = obj.get('Size', 0)
+
+            size_str = human_size(size_bytes)
+
+            console.print(f"[white][{utc_now()}][/white] [cyan]{key}[/cyan] ({size_str})")
+
+            with Progress(
+                BarColumn(bar_width=40),
+                TextColumn("{task.percentage:>3.0f}%"),
+                TextColumn("  "),
+                TextColumn("[green]{task.fields[speed]}[/green]"),
+                console=console,
+                transient=True
+            ) as progress:
+
+                task = progress.add_task("", total=size_bytes, speed="0 MB/s")
+                start_time = time.time()
+
+                def callback(bytes_amount):
+                    progress.update(task, advance=bytes_amount)
+                    elapsed = time.time() - start_time
+                    if elapsed > 0:
+                        done = progress.tasks[0].completed
+                        speed = (done / elapsed) / 1024 / 1024
+                        progress.update(task, speed=f"{speed:.0f} MB/s")
+
+                try:
+                    s3_dest.copy(
+                        {'Bucket': source_bucket, 'Key': key},
+                        dest_bucket,
+                        dest_key,
+                        Config=transfer_config,
+                        Callback=callback
+                    )
+
+                    files_copied += 1
+                    total_size_bytes += size_bytes
+
+                except Exception as e:
+                    files_failed += 1
+                    console.print(
+                        f"[red]✖ Failed to copy[/red] {key} "
+                        f"[green]→[/green] {dest_key}\n[red]{e}[/red]\n"
+                    )
+                    continue
+
+            elapsed = time.time() - start_time
+            avg_speed = (size_bytes / elapsed) / 1024 / 1024 if elapsed > 0 else 0.0
+            console.print(
+                f"[green]{'█' * 40}[/green] "
+                f"[white]100%[/white]   "
+                f"[green]{avg_speed:.0f} MB/s[/green]\n"
+            )
+
+    duration = time.time() - t0
+    avg_speed_total = (total_size_bytes / duration) / 1024 / 1024 if duration > 0 else 0.0
+
+    console.print(Rule("[bold cyan]📊 Copy Summary[/bold cyan]"))
+    summary = Table(show_header=False)
+    summary.add_row("Files Copied", str(files_copied))
+    summary.add_row("Failed", str(files_failed))
+    summary.add_row("Skipped", str(files_skipped))
+    summary.add_row("Total Size", human_size(total_size_bytes))
+    summary.add_row("Duration", time.strftime("%H:%M:%S", time.gmtime(duration)))
+    summary.add_row("Average Speed", f"{avg_speed_total:.0f} MB/s")
+    console.print(summary)
+
+    if files_failed == 0:
+        console.print("[green]✔ Copy completed successfully[/green]")
+    else:
+        console.print("[red]✖ Copy completed with errors[/red]")
+
+def main():
+    show_banner()
+    args = parse_args()
+
+    exclude_paths = [p.rstrip('/') + '/' for p in args.exclude_path] if args.exclude_path else []
+
+    # Credential setup
+    if args.mode == 'cross-account':
+        source_creds = prompt_for_credentials_block('SOURCE_SSO_ADMIN')
+        dest_creds = prompt_for_credentials_block('DESTINATION_SSO_ADMIN')
+        account_id = get_account_id(args.dest_region, dest_creds)
+    else:
+        admin_creds = prompt_for_credentials_block('SSO_ADMIN')
+        source_creds = admin_creds
+        dest_creds = admin_creds
+        account_id = get_account_id(args.source_region or args.dest_region, admin_creds)
+
+    iam_username = 's3copy-migration-user'
+    policy_name = 's3copy-migration-policy'
+    iam_user_arn = f"arn:aws:iam::{account_id}:user/{iam_username}"
+
+    # Cleanup mode
+    if args.cleanup:
+        console.print(f"\n[yellow]Cleaning up IAM user {iam_username} and policy {policy_name}...[/yellow]")
+        cleanup_iam_user_and_policy(dest_creds, iam_username, policy_name)
+        console.print("[yellow]Cleaning up migration IAM user statement from source bucket policy...[/yellow]")
+        cleanup_bucket_policy_for_iam_user(source_creds, args.source_bucket, iam_user_arn)
+        console.print("[green]✔ Cleanup complete[/green]")
+        return
+
+    # Config output
+    console.print(Rule("[bold cyan]S3 Copy Configuration[/bold cyan]"))
+    console.print(f"Mode        : {args.mode}")
+    console.print(f"Source      : [magenta]{args.source_bucket}[/magenta]")
+    console.print(f"Destination : [magenta]{args.dest_bucket}[/magenta]")
+    console.print(f"Prefix      : {args.source_path or '/'}")
+    console.print(f"Started     : {utc_now()}\n")
+
+    # Create IAM user + policy
+    iam_creds, iam_username, policy_name = create_iam_user_with_policy(
+        dest_creds,
+        account_id,
+        args.dest_bucket,
+        args.source_bucket
+    )
+    console.print("[green]✔ IAM user ready[/green]")
+
+    # Wait until IAM user is visible to AWS
+    wait_for_iam_user_exists(dest_creds, iam_username)
+
+    # Update source bucket policy
+    iam_user_arn = f"arn:aws:iam::{account_id}:user/{iam_username}"
+    update_source_bucket_policy_for_iam_user(source_creds, args.source_bucket, iam_user_arn)
+    console.print("[green]✔ Bucket policy updated[/green]")
+
+    # Wait for propagation
+    wait_for_iam_ready(args.source_bucket, args.source_region, iam_creds)
+
+    console.print("\n[bold cyan]Starting S3 copy operation using IAM user credentials[/bold cyan]")
+    console.print(f"From: [magenta]{args.source_bucket}[/magenta]")
+    console.print(f"To  : [magenta]{args.dest_bucket}[/magenta]\n")
+
+    # Copy using IAM CREDS (critical!)
+    copy_objects(
+        args.source_bucket,
+        args.dest_bucket,
+        args.source_region,
+        args.dest_region,
+        args.source_path,
+        args.dest_path,
+        iam_creds,
+        exclude_paths
+    )
+
+    console.print("\n[bold]To clean up:[/bold]")
+    console.print(f"\t - Delete IAM user {iam_username} and policy {policy_name} in account {account_id}.")
+    console.print(f"\t - Remove migration IAM user bucket policy statement from source bucket {args.source_bucket}.")
+
+if __name__ == "__main__":
+    main()
