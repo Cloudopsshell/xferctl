@@ -31,6 +31,16 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
+#### Installation to binary path
+
+You can manually install xferctl to your binary path with the following commands:
+
+```bash
+curl -o xferctl https://raw.githubusercontent.com/Cloudopsshell/xferctl/main/xferctl
+chmod +x xferctl
+sudo install -m 755 xferctl /usr/local/bin
+```
+
 ### Usage
 
 See `--help` for all options.
