@@ -39,6 +39,8 @@ You can manually install xferctl to your binary path with the following commands
 curl -o xferctl https://raw.githubusercontent.com/Cloudopsshell/xferctl/main/xferctl
 chmod +x xferctl
 sudo install -m 755 xferctl /usr/local/bin
+# If you updated your PATH, reload your shell configuration:
+source ~/.zshrc  # or source ~/.bashrc, depending on your shell
 ```
 
 ### Usage
