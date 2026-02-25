@@ -35,7 +35,7 @@ pip install -r requirements.txt
 
 See `--help` for all options.
 
-![alt text](screenshots/image.png)
+![alt text](screenshots/base.png)
 
 Basic S3 copy (same account):
 
@@ -55,13 +55,13 @@ Example cross-account copy:
 xferctl --mode cross-account --source-region eu-north-1 --source-bucket cloudopsshell-source-bucket --dest-region eu-west-1 --dest-bucket cloudopsshell-destination-bucket
 ```
 
-![alt text](screenshots/image-2.png)
+![alt text](screenshots/1.png)
 
-![alt text](screenshots/image-3.png)
+![alt text](screenshots/2.png)
 
-![alt text](screenshots/image-4.png)
+![alt text](screenshots/3.png)
 
-![alt text](screenshots/image-5.png)
+![alt text](screenshots/4.png)
 
 Clean-up:
 
@@ -69,7 +69,7 @@ Clean-up:
 xferctl --mode cross-account --source-region eu-north-1 --source-bucket cloudopsshell-source-bucket --dest-region eu-west-1 --dest-bucket cloudopsshell-destination-bucket --cleanup
 ```
 
-![alt text](screenshots/image-6.png)
+![alt text](screenshots/cleanup.png)
 
 
 ## Contributing
